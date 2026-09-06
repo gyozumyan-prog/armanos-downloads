@@ -1,0 +1,74 @@
+name: linux-smoke
+# Запуск собранного AppImage на настоящем Linux: окно, локальный интерфейс,
+# создание профиля, запуск профиля и наш движок в процессах. Без этого сборка
+# под Linux считается непроверенной и на сайте не показывается.
+on:
+  workflow_dispatch:
+    inputs:
+      asset:
+        description: 'AppImage (ссылка из выпуска)'
+        required: true
+        default: 'https://github.com/gyozumyan-prog/armanos-downloads/releases/download/v0.1.0/armanos-linux.AppImage'
+jobs:
+  smoke:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - name: Зависимости Electron и виртуальный экран
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libfuse2 libgtk-3-0 libnss3 libasound2 libxss1 libgbm1 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libcups2 libpango-1.0-0 libcairo2 libxfixes3 curl jq file
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
+      - name: Скачать AppImage
+        run: |
+          curl -sSL -o app.AppImage "${{ inputs.asset }}"
+          chmod +x app.AppImage
+          ls -la app.AppImage
+          file app.AppImage
+      - name: Распаковать без FUSE и назвать движок
+        run: |
+          ./app.AppImage --appimage-extract >/dev/null
+          ls squashfs-root | head -20
+          E=squashfs-root/resources/engines/armanos-browser
+          ls -la "$E" | head -8
+          file "$E/chrome" "$E/armanos-browser" 2>/dev/null || true
+          "$E/chrome" --version 2>/dev/null || "$E/armanos-browser" --version 2>/dev/null || echo "движок не ответил на --version (это ещё не приговор)"
+      - name: Поднять программу под xvfb (локальный интерфейс включён заранее)
+        run: |
+          mkdir -p /tmp/ud
+          echo '{"enabled":true,"port":50325,"token":"smoke-token"}' > /tmp/ud/local-api.json
+          export ARMANOS_DIAG=1
+          run_app() {
+            xvfb-run -a --server-args="-screen 0 1440x900x24" ./squashfs-root/AppRun --user-data-dir=/tmp/ud "$@" > app.log 2>&1 &
+            echo $! > app.pid
+            for i in $(seq 1 45); do sleep 2; if curl -s -m 2 http://127.0.0.1:50325/status >/dev/null; then echo "локальный интерфейс отвечает через $((i*2)) с"; return 0; fi; done
+            return 1
+          }
+          if run_app; then echo "SANDBOX=namespace" >> $GITHUB_ENV; else
+            echo "первый запуск не поднял интерфейс, хвост журнала:"; tail -30 app.log
+            pkill -f squashfs-root/AppRun || true; sleep 2
+            echo "повтор с --no-sandbox (это ослабление, и оно будет названо в итоге)"
+            run_app --no-sandbox && echo "SANDBOX=no-sandbox" >> $GITHUB_ENV || { echo "ПРОГРАММА НЕ ПОДНЯЛАСЬ"; tail -80 app.log; exit 1; }
+          fi
+          curl -s -m 3 http://127.0.0.1:50325/status; echo
+          echo "--- диагностика окна:"; grep -A16 '\[diag\]' app.log | head -24 || echo "диагностики окна нет"
+      - name: Создать профиль и запустить его через локальный интерфейс
+        run: |
+          H='x-api-token: smoke-token'
+          curl -s -m 15 -H "$H" -H 'content-type: application/json' -X POST http://127.0.0.1:50325/api/v1/profile/create -d '{"name":"smoke-linux","scenario":"privacy","fingerprintTemplate":"linux-chrome"}' | tee create.json; echo
+          ID=$(jq -r '.data.profileId // empty' create.json)
+          test -n "$ID" || { echo "профиль не создан"; exit 1; }
+          echo "профиль: $ID"
+          curl -s -m 90 -H "$H" -H 'content-type: application/json' -X POST http://127.0.0.1:50325/api/v1/browser/start -d "{\"profileId\":\"$ID\"}" | tee start.json; echo
+          sleep 20
+          echo "--- процессы движка:"; pgrep -af 'engines/armanos-browser' | cut -c1-160 | head -6 || true
+          if pgrep -f 'engines/armanos-browser/(chrome|armanos-browser)' >/dev/null; then
+            echo "ДВИЖОК ЗАПУЩЕН ($SANDBOX)"
+          else
+            echo "ДВИЖОК НЕ ЗАПУЩЕН: профиль открылся не нашим движком или не открылся вовсе"; tail -80 app.log; exit 1
+          fi
+          curl -s -m 10 -H "$H" http://127.0.0.1:50325/api/v1/browser/active | head -c 400; echo
+      - name: Журнал программы
+        if: always()
+        run: tail -120 app.log || true
