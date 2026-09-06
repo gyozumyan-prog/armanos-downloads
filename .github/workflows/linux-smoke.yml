@@ -39,6 +39,10 @@ jobs:
           mkdir -p /tmp/ud
           echo '{"enabled":true,"port":50325,"token":"smoke-token"}' > /tmp/ud/local-api.json
           export ARMANOS_DIAG=1
+          # Распакованный AppImage запускается через AppRun, а тот ждёт APPDIR,
+          # который обычно ставит сам AppImage: без него путь к программе
+          # превращается в «/armanos» (первый прогон 6 сентября упал на этом).
+          export APPDIR="$PWD/squashfs-root"
           run_app() {
             xvfb-run -a --server-args="-screen 0 1440x900x24" ./squashfs-root/AppRun --user-data-dir=/tmp/ud "$@" > app.log 2>&1 &
             echo $! > app.pid
